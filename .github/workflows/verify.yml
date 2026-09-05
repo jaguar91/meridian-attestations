@@ -1,0 +1,80 @@
+# The log proves itself in public (design §6, run mode 1).
+#
+# Two checks, two failure modes:
+#
+#   verify        the chain is internally consistent — every manifest is
+#                 byte-canonical, hashes chain, sequences and calendar days
+#                 are gapless, eras never regress, every manifest has its OTS
+#                 proof bound to its exact bytes. Runs on every push AND daily
+#                 on a schedule, because a chain that only verifies when
+#                 someone happens to push is not a public heartbeat.
+#
+#   append-only   no push may modify, rename, or delete a published manifest
+#                 (design §7: never delete, never amend — a wrong manifest is
+#                 corrected by a LATER manifest's corrections note). Proofs
+#                 are append-only for deletes/renames but MAY be modified:
+#                 a pending .ots is upgraded in place to its Bitcoin-attested
+#                 form when the calendar attestation completes (~hours), and
+#                 the verify job re-checks that the upgraded proof still
+#                 binds to the same manifest bytes.
+#
+# Branch protection (no force-push, no deletion on main) is configured on the
+# repo itself. Protection is a courtesy, not the security — the chain, the
+# public clones, and the anchors are (design §5).
+
+name: verify
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Daily, after the 09:00 UTC publish window (contracts §16 cadence).
+    - cron: '30 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: chain verifies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify the chain
+        run: node verify/verify.mjs
+
+  append-only:
+    name: append-only
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The diff below needs the pre-push commit too.
+          fetch-depth: 0
+
+      - name: No modification of published history
+        run: |
+          BEFORE="${{ github.event.before }}"
+          # First push to the branch (or a before-commit GitHub no longer has):
+          # diff against the empty tree, so everything counts as an addition.
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE" 2>/dev/null; then
+            BEFORE=$(git hash-object -t tree /dev/null)
+          fi
+          VIOLATIONS=$(git diff --name-status --diff-filter=MDR "$BEFORE" "${{ github.sha }}" -- manifests)
+          PROOF_VIOLATIONS=$(git diff --name-status --diff-filter=DR "$BEFORE" "${{ github.sha }}" -- proofs)
+          if [ -n "$VIOLATIONS" ] || [ -n "$PROOF_VIOLATIONS" ]; then
+            echo "::error::append-only violation — published files were modified, renamed, or deleted:"
+            echo "$VIOLATIONS"
+            echo "$PROOF_VIOLATIONS"
+            exit 1
+          fi
+          echo "append-only holds: nothing published was touched."
